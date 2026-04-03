@@ -1,137 +1,192 @@
 #!/usr/bin/env python3
 """cidr - CIDR/subnet calculator and IP range tool.
 
-One file. Zero deps. Knows your subnets.
+Analyze CIDR blocks, check IP membership, calculate subnets, and convert
+between CIDR notation and IP ranges.
 
 Usage:
-  cidr.py info 192.168.1.0/24       → subnet details
-  cidr.py contains 10.0.0.0/8 10.0.1.5  → check membership
-  cidr.py range 192.168.1.0/28      → list all IPs
-  cidr.py split 10.0.0.0/16 24      → split into /24s
-  cidr.py merge 10.0.0.0/24 10.0.1.0/24  → merge adjacent
-  cidr.py overlap 10.0.0.0/16 10.0.1.0/24  → check overlap
+    cidr info 192.168.1.0/24
+    cidr contains 10.0.0.0/8 10.0.1.50
+    cidr range 192.168.1.100 192.168.1.200
+    cidr split 10.0.0.0/16 --into 24
+    cidr overlap 192.168.0.0/16 192.168.1.0/24
+    cidr summarize 192.168.1.0/25 192.168.1.128/25
 """
-
 import argparse
 import ipaddress
-import json
 import sys
 
 
 def cmd_info(args):
-    net = ipaddress.ip_network(args.cidr, strict=False)
-    info = {
-        "network": str(net.network_address),
-        "broadcast": str(net.broadcast_address) if net.version == 4 else None,
-        "netmask": str(net.netmask),
-        "hostmask": str(net.hostmask),
-        "prefix": net.prefixlen,
-        "hosts": net.num_addresses - 2 if net.version == 4 and net.prefixlen < 31 else net.num_addresses,
-        "total_addresses": net.num_addresses,
-        "version": net.version,
-        "is_private": net.is_private,
-        "first_host": str(list(net.hosts())[0]) if net.num_addresses > 2 else str(net.network_address),
-        "last_host": str(list(net.hosts())[-1]) if net.num_addresses > 2 else str(net.broadcast_address),
-    }
-    if args.json:
-        print(json.dumps(info, indent=2))
-    else:
-        for k, v in info.items():
-            print(f"  {k:18s} {v}")
+    """Show detailed info about a CIDR block."""
+    try:
+        net = ipaddress.ip_network(args.cidr, strict=False)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"  Network:     {net.network_address}/{net.prefixlen}")
+    print(f"  Netmask:     {net.netmask}")
+    if hasattr(net, 'hostmask'):
+        print(f"  Wildcard:    {net.hostmask}")
+    print(f"  Broadcast:   {net.broadcast_address}")
+    print(f"  First host:  {net.network_address + 1}" if net.num_addresses > 2 else f"  First host:  {net.network_address}")
+    print(f"  Last host:   {net.broadcast_address - 1}" if net.num_addresses > 2 else f"  Last host:   {net.broadcast_address}")
+    print(f"  Addresses:   {net.num_addresses:,}")
+    usable = max(0, net.num_addresses - 2) if net.version == 4 and net.prefixlen < 31 else net.num_addresses
+    print(f"  Usable:      {usable:,}")
+    print(f"  Version:     IPv{net.version}")
+    print(f"  Private:     {net.is_private}")
+    print(f"  Class:       {_ip_class(net)}") if net.version == 4 else None
+
+    # Binary representation for IPv4
+    if net.version == 4:
+        addr_int = int(net.network_address)
+        mask_int = int(net.netmask)
+        addr_bin = f"{addr_int:032b}"
+        mask_bin = f"{mask_int:032b}"
+        addr_dotted = ".".join(addr_bin[i:i+8] for i in range(0, 32, 8))
+        mask_dotted = ".".join(mask_bin[i:i+8] for i in range(0, 32, 8))
+        print(f"  Binary addr: {addr_dotted}")
+        print(f"  Binary mask: {mask_dotted}")
+
+
+def _ip_class(net):
+    first_octet = int(net.network_address) >> 24
+    if first_octet < 128: return "A"
+    if first_octet < 192: return "B"
+    if first_octet < 224: return "C"
+    if first_octet < 240: return "D (multicast)"
+    return "E (reserved)"
 
 
 def cmd_contains(args):
-    net = ipaddress.ip_network(args.cidr, strict=False)
-    ip = ipaddress.ip_address(args.ip)
+    """Check if an IP is within a CIDR block."""
+    try:
+        net = ipaddress.ip_network(args.cidr, strict=False)
+        ip = ipaddress.ip_address(args.ip)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
     if ip in net:
-        print(f"✅ {args.ip} is in {args.cidr}")
+        print(f"  ✅ {ip} is within {net}")
     else:
-        print(f"❌ {args.ip} is NOT in {args.cidr}")
-        return 1
-    return 0
+        print(f"  ❌ {ip} is NOT within {net}")
+    sys.exit(0 if ip in net else 1)
 
 
 def cmd_range(args):
-    net = ipaddress.ip_network(args.cidr, strict=False)
-    limit = args.limit or 256
-    for i, ip in enumerate(net.hosts()):
-        if i >= limit:
-            print(f"  ... ({net.num_addresses - 2 - limit} more)")
-            break
-        print(str(ip))
+    """Find the smallest CIDR block(s) covering an IP range."""
+    try:
+        start = ipaddress.ip_address(args.start)
+        end = ipaddress.ip_address(args.end)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    nets = list(ipaddress.summarize_address_range(start, end))
+    total = sum(n.num_addresses for n in nets)
+    print(f"  Range: {start} - {end}")
+    print(f"  Total addresses: {total:,}")
+    print(f"  CIDR blocks ({len(nets)}):")
+    for n in nets:
+        print(f"    {n} ({n.num_addresses:,} addresses)")
 
 
 def cmd_split(args):
-    net = ipaddress.ip_network(args.cidr, strict=False)
-    new_prefix = int(args.prefix)
-    if new_prefix <= net.prefixlen:
-        print(f"New prefix /{new_prefix} must be larger than /{net.prefixlen}", file=sys.stderr)
-        return 1
-    subnets = list(net.subnets(new_prefix=new_prefix))
-    for s in subnets[:100]:
-        hosts = s.num_addresses - 2 if s.version == 4 and s.prefixlen < 31 else s.num_addresses
-        print(f"  {str(s):20s}  ({hosts} hosts)")
-    if len(subnets) > 100:
-        print(f"  ... ({len(subnets) - 100} more)")
+    """Split a CIDR block into smaller subnets."""
+    try:
+        net = ipaddress.ip_network(args.cidr, strict=False)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
+    target = args.into
+    if target <= net.prefixlen:
+        print(f"Error: target prefix /{target} must be larger than /{net.prefixlen}", file=sys.stderr)
+        sys.exit(1)
 
-def cmd_merge(args):
-    nets = [ipaddress.ip_network(c, strict=False) for c in args.cidrs]
-    merged = list(ipaddress.collapse_addresses(nets))
-    for m in merged:
-        print(str(m))
+    subnets = list(net.subnets(new_prefix=target))
+    print(f"  Splitting {net} into /{target} subnets:")
+    print(f"  Count: {len(subnets)}")
+    limit = 32
+    for i, s in enumerate(subnets[:limit]):
+        usable = max(0, s.num_addresses - 2) if s.version == 4 and s.prefixlen < 31 else s.num_addresses
+        print(f"    {s} ({usable:,} usable)")
+    if len(subnets) > limit:
+        print(f"    ... and {len(subnets) - limit} more")
 
 
 def cmd_overlap(args):
-    a = ipaddress.ip_network(args.cidr1, strict=False)
-    b = ipaddress.ip_network(args.cidr2, strict=False)
+    """Check if two CIDR blocks overlap."""
+    try:
+        a = ipaddress.ip_network(args.cidr1, strict=False)
+        b = ipaddress.ip_network(args.cidr2, strict=False)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
     if a.overlaps(b):
-        print(f"✅ {args.cidr1} and {args.cidr2} overlap")
+        print(f"  ✅ {a} and {b} overlap")
+        if a.subnet_of(b):
+            print(f"     {a} is a subnet of {b}")
+        elif b.subnet_of(a):
+            print(f"     {b} is a subnet of {a}")
     else:
-        print(f"❌ {args.cidr1} and {args.cidr2} do NOT overlap")
-        return 1
-    return 0
+        print(f"  ❌ {a} and {b} do NOT overlap")
+    sys.exit(0 if a.overlaps(b) else 1)
+
+
+def cmd_summarize(args):
+    """Summarize multiple CIDR blocks into minimal set."""
+    nets = []
+    for c in args.cidrs:
+        try:
+            nets.append(ipaddress.ip_network(c, strict=False))
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    collapsed = list(ipaddress.collapse_addresses(nets))
+    total = sum(n.num_addresses for n in collapsed)
+    print(f"  Input: {len(nets)} networks")
+    print(f"  Summarized: {len(collapsed)} networks")
+    print(f"  Total addresses: {total:,}")
+    for n in collapsed:
+        print(f"    {n}")
 
 
 def main():
-    p = argparse.ArgumentParser(description="CIDR/subnet calculator")
-    sub = p.add_subparsers(dest="cmd")
+    parser = argparse.ArgumentParser(description="CIDR/subnet calculator")
+    sub = parser.add_subparsers(dest="command", required=True)
 
-    s = sub.add_parser("info")
-    s.add_argument("cidr")
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(func=cmd_info)
+    p = sub.add_parser("info", help="Analyze a CIDR block")
+    p.add_argument("cidr")
 
-    s = sub.add_parser("contains")
-    s.add_argument("cidr")
-    s.add_argument("ip")
-    s.set_defaults(func=cmd_contains)
+    p = sub.add_parser("contains", help="Check IP membership in CIDR")
+    p.add_argument("cidr")
+    p.add_argument("ip")
 
-    s = sub.add_parser("range")
-    s.add_argument("cidr")
-    s.add_argument("--limit", type=int, default=256)
-    s.set_defaults(func=cmd_range)
+    p = sub.add_parser("range", help="IP range to CIDR blocks")
+    p.add_argument("start")
+    p.add_argument("end")
 
-    s = sub.add_parser("split")
-    s.add_argument("cidr")
-    s.add_argument("prefix")
-    s.set_defaults(func=cmd_split)
+    p = sub.add_parser("split", help="Split CIDR into smaller subnets")
+    p.add_argument("cidr")
+    p.add_argument("--into", type=int, required=True, help="Target prefix length")
 
-    s = sub.add_parser("merge")
-    s.add_argument("cidrs", nargs="+")
-    s.set_defaults(func=cmd_merge)
+    p = sub.add_parser("overlap", help="Check if two CIDRs overlap")
+    p.add_argument("cidr1")
+    p.add_argument("cidr2")
 
-    s = sub.add_parser("overlap")
-    s.add_argument("cidr1")
-    s.add_argument("cidr2")
-    s.set_defaults(func=cmd_overlap)
+    p = sub.add_parser("summarize", help="Collapse CIDRs into minimal set")
+    p.add_argument("cidrs", nargs="+")
 
-    args = p.parse_args()
-    if not args.cmd:
-        p.print_help()
-        return 1
-    return args.func(args) or 0
+    args = parser.parse_args()
+    {"info": cmd_info, "contains": cmd_contains, "range": cmd_range,
+     "split": cmd_split, "overlap": cmd_overlap, "summarize": cmd_summarize}[args.command](args)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
